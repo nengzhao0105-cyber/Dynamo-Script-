@@ -1,0 +1,157 @@
+{
+  "Uuid": "f758688790855c5cbfad71b6a4a2b85e",
+  "IsCustomNode": false,
+  "Description": "Revit 2025: preview or apply one color filter per STRATUS Assembly in the active view.",
+  "Name": "STRATUS Assembly Colors",
+  "ElementResolver": {
+    "ResolutionMap": {}
+  },
+  "Inputs": [],
+  "Outputs": [],
+  "Nodes": [
+    {
+      "ConcreteType": "CoreNodeModels.Input.BoolSelector, CoreNodeModels",
+      "NodeType": "BooleanInputNode",
+      "InputValue": false,
+      "Id": "810e7940a684522f9dcc78a99ca5a032",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "7c1fc96556505313b0cb1a932295abff",
+          "Name": "",
+          "Description": "",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "False previews; True applies colors to the active view."
+    },
+    {
+      "ConcreteType": "PythonNodeModels.PythonNode, PythonNodeModels",
+      "NodeType": "PythonScriptNode",
+      "Code": "\"\"\"Dynamo CPython3 / Revit 2025. IN[0]: apply (False previews).\"\"\"\nimport clr\nimport colorsys\nimport hashlib\nimport re\nclr.AddReference('RevitAPI')\nclr.AddReference('RevitServices')\nfrom Autodesk.Revit.DB import (FilteredElementCollector, ParameterFilterElement,\n    ParameterFilterUtilities, ParameterFilterRuleFactory, ElementParameterFilter,\n    ElementId, StorageType, BuiltInParameter, FillPatternElement,\n    FillPatternTarget, OverrideGraphicSettings, Color, SubTransaction,\n    TransactionStatus)\nfrom RevitServices.Persistence import DocumentManager\nfrom RevitServices.Transactions import TransactionManager\nfrom System.Collections.Generic import List\n\nPARAMETER = 'STRATUS Assembly'\nPREFIX = 'DYN STRATUS - '\n\n\ndef filter_name(value, parameter_id, categories):\n    # Category signature prevents changing filters already used by other views.\n    key = '{}|{}|{}'.format(parameter_id, ','.join(map(str, sorted(categories))), value)\n    digest = hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]\n    label = re.sub(r'[\\\\:{}\\[\\]|;<>?`~\\r\\n]', '_', value)[:100]\n    return PREFIX + label + ' - ' + digest\n\n\ndef choose_color(used):\n    candidates = []\n    for saturation, brightness in [(0.85, 0.78), (0.65, 0.60), (0.60, 0.92)]:\n        for n in range(72):\n            candidates.append(tuple(int(round(c * 255)) for c in\n                                    colorsys.hsv_to_rgb(n / 72.0, saturation, brightness)))\n    def distance(a, b):\n        return sum((x - y) ** 2 for x, y in zip(a, b))\n    if not used:\n        return (30, 110, 200)\n    return max(candidates, key=lambda c: min(distance(c, old) for old in used))\n\n\ndef prepare_view(view, keep_ids):\n    view.ViewTemplateId = ElementId.InvalidElementId\n    for fid in view.GetFilters():\n        if fid.Value not in keep_ids:\n            view.SetIsFilterEnabled(fid, False)\n\n\ndef main(apply):\n    doc = DocumentManager.Instance.CurrentDBDocument\n    view = doc.ActiveView\n    if doc.IsFamilyDocument or view.IsTemplate or not view.AreGraphicsOverridesAllowed():\n        raise ValueError('Open a model drawing view (plan, section, elevation, or 3D).')\n    template = doc.GetElement(view.ViewTemplateId)\n    template_name = template.Name if template else None\n\n    warnings = []\n    groups = {}\n    category_ids = {}\n    parameter_ids = {}\n    counts = {'blank': 0, 'no_parameter': 0, 'unsupported': 0}\n    eligible = {x.Value for x in ParameterFilterUtilities.GetAllFilterableCategories()}\n    for element in FilteredElementCollector(doc, view.Id).WhereElementIsNotElementType():\n        if element.Category is None:\n            continue\n        parameters = list(element.GetParameters(PARAMETER))\n        if not parameters:\n            element_type = doc.GetElement(element.GetTypeId())\n            parameters = list(element_type.GetParameters(PARAMETER)) if element_type else []\n        if not parameters:\n            counts['no_parameter'] += 1\n            continue\n        if len(parameters) != 1:\n            raise ValueError('Multiple parameters named STRATUS Assembly on element {}. Resolve the duplicate names first.'.format(element.Id.Value))\n        p = parameters[0]\n        if p.StorageType != StorageType.String or element.Category.Id.Value not in eligible:\n            counts['unsupported'] += 1\n            continue\n        value = p.AsString()\n        if not value or not value.strip():\n            counts['blank'] += 1\n            continue\n        # Revit string equality is case insensitive; retain whitespace in the rule.\n        key = value.lower()\n        group = groups.setdefault(key, {'value': value, 'count': 0})\n        group['count'] += 1\n        category_ids[element.Category.Id.Value] = element.Category.Id\n        parameter_ids[p.Id.Value] = p.Id\n    if not groups:\n        return {'status': 'No nonblank, filterable text values found.', 'skipped': counts}\n    if len(parameter_ids) != 1:\n        raise ValueError('Different parameter definitions share the STRATUS Assembly name. Use one shared/project parameter definition across spool categories.')\n    pid = next(iter(parameter_ids.values()))\n    categories = List[ElementId](list(category_ids.values()))\n    common = {x.Value for x in ParameterFilterUtilities.GetFilterableParametersInCommon(doc, categories)}\n    if pid.Value not in common:\n        raise ValueError('STRATUS Assembly is not filterable across the detected categories. Check its project/shared parameter bindings.')\n    solid = next((x for x in FilteredElementCollector(doc).OfClass(FillPatternElement)\n                  if x.GetFillPattern().IsSolidFill and\n                  x.GetFillPattern().Target == FillPatternTarget.Drafting), None)\n    if solid is None:\n        raise ValueError('No drafting Solid Fill pattern found.')\n\n    existing = {x.Name: x for x in FilteredElementCollector(doc).OfClass(ParameterFilterElement)}\n    applied = {x.Value for x in view.GetFilters()}\n    used = []\n    # Preserve colors of this tool's filters, including values no longer visible.\n    for f in existing.values():\n        if f.Name.startswith(PREFIX) and f.Id.Value in applied:\n            c = view.GetFilterOverrides(f.Id).ProjectionLineColor\n            if c.IsValid:\n                used.append((int(c.Red), int(c.Green), int(c.Blue)))\n    plan = []\n    for key in sorted(groups):\n        group = groups[key]\n        name = filter_name(key, pid.Value, category_ids)\n        f = existing.get(name)\n        rgb = None\n        if f is not None:\n            # Never silently overwrite a manually changed rule.\n            rules = f.GetElementFilter()\n            # Check the stored single equality rule before reusing it.\n            if not isinstance(rules, ElementParameterFilter):\n                raise ValueError('Existing tool filter was edited: ' + name)\n            old_rules = list(rules.GetRules())\n            if (len(old_rules) != 1 or old_rules[0].GetRuleParameter() != pid or\n                not hasattr(old_rules[0], 'RuleString') or\n                old_rules[0].RuleString.lower() != key or\n                old_rules[0].GetEvaluator().GetType().Name != 'FilterStringEquals' or\n                {x.Value for x in f.GetCategories()} != set(category_ids)):\n                raise ValueError('Existing tool filter was edited: ' + name)\n            if f.Id.Value in applied:\n                c = view.GetFilterOverrides(f.Id).ProjectionLineColor\n                if c.IsValid:\n                    rgb = (int(c.Red), int(c.Green), int(c.Blue))\n        if rgb is None:\n            rgb = choose_color(used)\n            used.append(rgb)\n        plan.append((group, name, f, rgb))\n    if len(groups) > 20:\n        warnings.append('More than 20 assemblies: some colors may be hard to distinguish. Keep assembly tags on the drawing.')\n    warnings.append('Element overrides, view settings, and linked-model graphics can affect the final appearance. Colors are assigned per view; linked elements are not processed.')\n\n    result = {'status': 'Preview only; set Apply to True to create/apply filters.',\n              'template_to_remove': template_name,\n              'other_filters_to_disable': [doc.GetElement(fid).Name for fid in view.GetFilters()\n                  if fid.Value not in {f.Id.Value for g, n, f, rgb in plan if f is not None}],\n              'view': view.Name, 'parameter': PARAMETER, 'skipped': counts,\n              'warnings': warnings, 'assemblies': [\n                  {'assembly': g['value'], 'elements_in_view_collector': g['count'],\n                   'filter': n, 'RGB': list(rgb), 'action': 'reuse' if f else 'create'}\n                  for g, n, f, rgb in plan]}\n    if not apply:\n        return result\n    manager = TransactionManager.Instance\n    manager.EnsureInTransaction(doc)\n    sub = SubTransaction(doc)\n    sub.Start()\n    try:\n        # Keep view preparation and color changes in the same rollback boundary.\n        keep_ids = {f.Id.Value for g, n, f, rgb in plan if f is not None}\n        prepare_view(view, keep_ids)\n        for group, name, f, rgb in plan:\n            if f is None:\n                rule = ParameterFilterRuleFactory.CreateEqualsRule(pid, group['value'])\n                f = ParameterFilterElement.Create(doc, name, categories, ElementParameterFilter(rule))\n            ogs = view.GetFilterOverrides(f.Id) if f.Id.Value in applied else OverrideGraphicSettings()\n            color = Color(*rgb)\n            ogs.SetProjectionLineColor(color)\n            ogs.SetCutLineColor(color)\n            ogs.SetSurfaceForegroundPatternId(solid.Id)\n            ogs.SetSurfaceForegroundPatternColor(color)\n            ogs.SetSurfaceForegroundPatternVisible(True)\n            ogs.SetCutForegroundPatternId(solid.Id)\n            ogs.SetCutForegroundPatternColor(color)\n            ogs.SetCutForegroundPatternVisible(True)\n            view.SetFilterOverrides(f.Id, ogs)\n            view.SetFilterVisibility(f.Id, True)\n            view.SetIsFilterEnabled(f.Id, True)\n        if sub.Commit() != TransactionStatus.Committed:\n            raise RuntimeError('Revit did not commit the filter changes.')\n    except Exception:\n        if sub.GetStatus() == TransactionStatus.Started:\n            sub.RollBack()\n        raise\n    finally:\n        manager.TransactionTaskDone()\n    result['removed_template'] = template_name\n    result['disabled_other_filters'] = result.pop('other_filters_to_disable')\n    result.pop('template_to_remove')\n    result['status'] = 'Applied {} assembly filters.'.format(len(plan))\n    return result\n\n\ntry:\n    OUT = main(bool(IN[0]) if IN and IN[0] is not None else False)\nexcept Exception as error:\n    OUT = {'status': 'Stopped', 'error': str(error)}\n",
+      "Engine": "CPython3",
+      "VariableInputPorts": true,
+      "Id": "5dd1a83d5c1f5f16b82732f087e2b220",
+      "Inputs": [
+        {
+          "Id": "de2a3ad40b6453d08500abf4ca00fb4c",
+          "Name": "IN[0]",
+          "Description": "IN[0]",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "b46991d288f751f999ebc9e08514610c",
+          "Name": "OUT",
+          "Description": "OUT",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Create STRATUS Assembly color filters."
+    },
+    {
+      "ConcreteType": "CoreNodeModels.Watch, CoreNodeModels",
+      "NodeType": "ExtensionNode",
+      "Id": "718ade943c6d5508ae3c1fa0c3ce1943",
+      "Inputs": [
+        {
+          "Id": "600f3fd2e4f051d5a58c402a16122f51",
+          "Name": "",
+          "Description": "",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "d1d977f2a5c45288a487b050d5b7b93f",
+          "Name": "",
+          "Description": "",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Preview, results and diagnostics."
+    }
+  ],
+  "Connectors": [
+    {
+      "Start": "7c1fc96556505313b0cb1a932295abff",
+      "End": "de2a3ad40b6453d08500abf4ca00fb4c",
+      "Id": "a0b6222051b35892900ea5b0dbfd7ae1",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "b46991d288f751f999ebc9e08514610c",
+      "End": "600f3fd2e4f051d5a58c402a16122f51",
+      "Id": "0d6fa819ede250ec8c6f826269f8b5a2",
+      "IsHidden": "False"
+    }
+  ],
+  "Dependencies": [],
+  "NodeLibraryDependencies": [],
+  "Bindings": [],
+  "View": {
+    "Dynamo": {
+      "ScaleFactor": 1.0,
+      "HasRunWithoutCrash": false,
+      "IsVisibleInDynamoLibrary": true,
+      "Version": "3.0.3.7597",
+      "RunType": "Manual",
+      "RunPeriod": "1000"
+    },
+    "NodeViews": [
+      {
+        "Id": "810e7940a684522f9dcc78a99ca5a032",
+        "Name": "Apply colors (False = preview)",
+        "IsSetAsInput": true,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": false,
+        "X": 0.0,
+        "Y": 150.0
+      },
+      {
+        "Id": "5dd1a83d5c1f5f16b82732f087e2b220",
+        "Name": "STRATUS Assembly Colors",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": false,
+        "X": 340.0,
+        "Y": 150.0
+      },
+      {
+        "Id": "718ade943c6d5508ae3c1fa0c3ce1943",
+        "Name": "Results / assembly colors",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": true,
+        "Excluded": false,
+        "ShowGeometry": false,
+        "X": 700.0,
+        "Y": 150.0
+      }
+    ],
+    "Annotations": [],
+    "X": 40.0,
+    "Y": 80.0,
+    "Zoom": 0.85
+  }
+}

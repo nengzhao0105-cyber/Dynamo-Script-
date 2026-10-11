@@ -1,0 +1,301 @@
+{
+  "Uuid": "511da41823965c7e9763f4eaa703e441",
+  "IsCustomNode": false,
+  "Description": "Revit 2025 project-wide STRATUS weights, schedule and package Excel heat map.",
+  "Name": "STRATUS Assembly Weight Report",
+  "ElementResolver": {
+    "ResolutionMap": {
+      "DSCore.DateTime.Now": {
+        "Key": "DSCore.DateTime",
+        "Value": "DSCoreNodes.dll"
+      },
+      "DSCore.DateTime": {
+        "Key": "DSCore.DateTime",
+        "Value": "DSCoreNodes.dll"
+      }
+    }
+  },
+  "Inputs": [],
+  "Outputs": [],
+  "Nodes": [
+    {
+      "ConcreteType": "CoreNodeModels.Input.BoolSelector, CoreNodeModels",
+      "NodeType": "BooleanInputNode",
+      "InputValue": false,
+      "Id": "b2579cfcd50e5f1e8dd8701238b5d1f7",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "14ead72ea28d5e949bd3d86e1d282bc2",
+          "Name": "",
+          "Description": "",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "False previews; True writes parameters and replaces the report schedule."
+    },
+    {
+      "ConcreteType": "CoreNodeModels.Input.BoolSelector, CoreNodeModels",
+      "NodeType": "BooleanInputNode",
+      "InputValue": false,
+      "Id": "cc86b81af3cf583f915f1b32024e9a7d",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "8ad656291420530e8a0c62d6553a10e5",
+          "Name": "",
+          "Description": "",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Show the package picker and create a formatted Excel report after Apply."
+    },
+    {
+      "ConcreteType": "CoreNodeModels.Input.StringInput, CoreNodeModels",
+      "NodeType": "StringInputNode",
+      "InputValue": "",
+      "Id": "650d5231c2995fcd8c76f42a67c0cdb9",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "b8f11eb1ed9758618342942aabc4d524",
+          "Name": "",
+          "Description": "",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Excel destination folder. Blank uses the current Windows Downloads folder."
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.ZeroTouch.DSFunction, DynamoCore",
+      "NodeType": "FunctionNode",
+      "FunctionSignature": "DSCore.DateTime.Now",
+      "Id": "b47083f6792b5485b903f1cf12cc80c8",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "8299b132d8fd57058d43c72b42fbc6e4",
+          "Name": "dateTime",
+          "Description": "dateTime",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Auto",
+      "Description": "Changes on every Manual Run so the package picker can be opened repeatedly."
+    },
+    {
+      "ConcreteType": "PythonNodeModels.PythonNode, PythonNodeModels",
+      "NodeType": "PythonScriptNode",
+      "Code": "\"\"\"Dynamo CPython3 / Revit 2025.\n\nIN[0]: Apply changes (False = preview)\nIN[1]: Create package Excel report (only exports when Apply is True)\nIN[2]: Excel folder (blank = Downloads)\nIN[3]: Volatile DateTime trigger supplied by the graph; do not edit\n\"\"\"\nimport clr\nimport datetime\nimport os\nimport re\nimport tempfile\nimport zipfile\nfrom collections import OrderedDict\nfrom System import Guid\n\nclr.AddReference('RevitAPI')\nclr.AddReference('RevitServices')\nfrom Autodesk.Revit.DB import (\n    BuiltInCategory, BuiltInParameter, Category, CategorySet, ElementId,\n    ExternalDefinitionCreationOptions, FilteredElementCollector, ForgeTypeId,\n    InstanceBinding, ScheduleFieldType, ScheduleFilter, ScheduleFilterType,\n    ScheduleSortGroupField, SpecTypeId, StorageType, SubTransaction,\n    TransactionStatus, UnitTypeId, UnitUtils, ViewSchedule, FabricationPart\n)\nfrom RevitServices.Persistence import DocumentManager\nfrom RevitServices.Transactions import TransactionManager\n\nASSEMBLY = 'STRATUS Assembly'\nPACKAGE = 'STRATUS Package Name'\nASSEMBLY_NAME = 'STRATUS Assembly Name'\nPIECE_COUNT = 'STRATUS Assembly Piece Count'\nTOTAL_WEIGHT = 'STRATUS Assembly Total Weight'\nWEIGHT = 'Weight'\nSCHEDULE_NAME = 'STRATUS Assembly Weight Report'\nPHASE_NAME = 'New Construction'\n\n# Stable GUIDs make reruns and deployment to multiple models predictable.\nPARAMETERS = OrderedDict([\n    (ASSEMBLY_NAME, (Guid('11aa11aa-2bb2-4cc4-8dd8-111111111111'), SpecTypeId.String.Text)),\n    (PIECE_COUNT, (Guid('22bb22bb-3cc3-4dd4-8ee8-222222222222'), SpecTypeId.Int.Integer)),\n    (TOTAL_WEIGHT, (Guid('33cc33cc-4dd4-4ee4-8ff8-333333333333'), SpecTypeId.Mass)),\n])\n\n\ndef eid_value(eid):\n    \"\"\"Revit 2025 uses Value; this fallback also permits source-level testing.\"\"\"\n    return eid.Value if hasattr(eid, 'Value') else eid.IntegerValue\n\n\ndef clean_number(text):\n    if not text:\n        return None\n    match = re.search(r'[-+]?\\d[\\d,.]*', text.replace(' ', ''))\n    if not match:\n        return None\n    token = match.group(0)\n    if token.count(',') and token.count('.'):\n        token = token.replace(',', '')\n    else:\n        token = token.replace(',', '.')\n    try:\n        return float(token)\n    except ValueError:\n        return None\n\n\ndef parameter_text(element, name):\n    p = element.LookupParameter(name)\n    if p is None:\n        return None\n    if p.StorageType == StorageType.String:\n        return p.AsString()\n    return p.AsValueString()\n\n\ndef weight_lbm(element):\n    \"\"\"Return (pounds mass, error). Prefer typed Revit unit conversion.\"\"\"\n    p = element.LookupParameter(WEIGHT)\n    if p is None:\n        return None, 'missing Weight'\n    if p.StorageType == StorageType.Double:\n        raw = p.AsDouble()\n        try:\n            return UnitUtils.ConvertFromInternalUnits(raw, UnitTypeId.PoundsMass), None\n        except Exception:\n            parsed = clean_number(p.AsValueString())\n            return (parsed, None) if parsed is not None else (None, 'unreadable Weight')\n    parsed = clean_number(p.AsString() if p.StorageType == StorageType.String else p.AsValueString())\n    return (parsed, None) if parsed is not None else (None, 'unreadable Weight')\n\n\ndef coupling_description(element):\n    \"\"\"Return the matching description when a separate part is a coupling.\"\"\"\n    values = []\n    for attribute in ('ProductShortDescription', 'Alias', 'Name'):\n        try:\n            value = getattr(element, attribute)\n            if value:\n                values.append(str(value))\n        except Exception:\n            pass\n    for parameter_name in ('Item Name', 'Product Name', 'Description', 'STRATUS Item Name'):\n        value = parameter_text(element, parameter_name)\n        if value:\n            values.append(value)\n    for value in values:\n        if re.search(r'coupl', value, re.IGNORECASE):\n            return value\n    return None\n\n\ndef get_existing_phase(doc):\n    matches = [p for p in doc.Phases if p.Name == PHASE_NAME]\n    if len(matches) != 1:\n        raise ValueError('Expected exactly one phase named \"{}\"; found {}.'.format(PHASE_NAME, len(matches)))\n    return matches[0]\n\n\ndef collect(doc):\n    phase = get_existing_phase(doc)\n    groups = OrderedDict()\n    skipped = {'blank_assembly': 0, 'wrong_phase': 0, 'missing_weight': 0,\n               'unreadable_weight': 0}\n    packages = set()\n    parts = (FilteredElementCollector(doc)\n             .OfCategory(BuiltInCategory.OST_FabricationPipework)\n             .WhereElementIsNotElementType())\n    for part in parts:\n        # Fabrication hangers have their own category; retaining this test protects\n        # against unusual fabrication content/category mappings.\n        if not isinstance(part, FabricationPart):\n            continue\n        if eid_value(part.CreatedPhaseId) != eid_value(phase.Id):\n            skipped['wrong_phase'] += 1\n            continue\n        if part.DemolishedPhaseId != ElementId.InvalidElementId and eid_value(part.DemolishedPhaseId) == eid_value(phase.Id):\n            skipped['wrong_phase'] += 1\n            continue\n        assembly = parameter_text(part, ASSEMBLY)\n        if assembly is None or not assembly.strip():\n            skipped['blank_assembly'] += 1\n            continue\n        pounds, error = weight_lbm(part)\n        if error:\n            skipped['missing_weight' if error == 'missing Weight' else 'unreadable_weight'] += 1\n            continue\n        service = ''\n        try:\n            service = part.ServiceAbbreviation or ''\n        except Exception:\n            service = parameter_text(part, 'Service Abbreviation') or ''\n        package = parameter_text(part, PACKAGE)\n        if package is not None and package.strip():\n            packages.add(package)\n        # Exact text is intentionally the dictionary key: case and whitespace differ.\n        group = groups.setdefault(assembly, {'assembly_id': assembly,\n            'assembly_name': assembly, 'services': set(), 'elements': [],\n            'packages': set(),\n            'piece_count': 0, 'total_weight_lbm': 0.0})\n        if service:\n            group['services'].add(service)\n        group['elements'].append(part)\n        if package is not None and package.strip():\n            group['packages'].add(package)\n        group['piece_count'] += 1\n        group['total_weight_lbm'] += pounds\n    for group in groups.values():\n        group['service'] = ', '.join(sorted(group.pop('services')))\n        group['excluded_couplings'] = []\n        group['coupling_adjustment_lbm'] = 0.0\n        for element in group['elements']:\n            description = coupling_description(element)\n            if description is None:\n                continue\n            pounds, error = weight_lbm(element)\n            if error or pounds is None:\n                continue\n            group['excluded_couplings'].append({\n                'element_id': eid_value(element.Id), 'description': description,\n                'weight_lbm': pounds})\n            group['coupling_adjustment_lbm'] += pounds\n        group['actual_weight_lbm'] = max(\n            0.0, group['total_weight_lbm'] - group['coupling_adjustment_lbm'])\n    return groups, skipped, phase, sorted(packages)\n\n\ndef ensure_parameters(doc, app):\n    \"\"\"Create stable shared instance parameters bound to fabrication pipework.\"\"\"\n    old_path = app.SharedParametersFilename\n    fd, path = tempfile.mkstemp(prefix='stratus_weight_', suffix='.txt')\n    os.close(fd)\n    try:\n        with open(path, 'w') as shared:\n            shared.write('# This is a Revit shared parameter file.\\n')\n            shared.write('# Do not edit manually.\\n')\n            shared.write('*META\\tVERSION\\tMINVERSION\\nMETA\\t2\\t1\\n')\n            shared.write('*GROUP\\tID\\tNAME\\n')\n            shared.write('*PARAM\\tGUID\\tNAME\\tDATATYPE\\tDATACATEGORY\\tGROUP\\tVISIBLE\\tDESCRIPTION\\tUSERMODIFIABLE\\tHIDEWHENNOVALUE\\n')\n        app.SharedParametersFilename = path\n        definition_file = app.OpenSharedParameterFile()\n        definition_group = definition_file.Groups.Create('Dynamo STRATUS')\n        category = Category.GetCategory(doc, BuiltInCategory.OST_FabricationPipework)\n        categories = app.Create.NewCategorySet()\n        categories.Insert(category)\n        binding = app.Create.NewInstanceBinding(categories)\n        existing_names = set()\n        iterator = doc.ParameterBindings.ForwardIterator()\n        iterator.Reset()\n        while iterator.MoveNext():\n            existing_names.add(iterator.Key.Name)\n        for name, (guid, data_type) in PARAMETERS.items():\n            if name in existing_names:\n                continue\n            options = ExternalDefinitionCreationOptions(name, data_type)\n            options.GUID = guid\n            definition = definition_group.Definitions.Create(options)\n            if not doc.ParameterBindings.Insert(definition, binding):\n                raise RuntimeError('Could not create project parameter: ' + name)\n    finally:\n        app.SharedParametersFilename = old_path\n        try:\n            os.remove(path)\n        except Exception:\n            pass\n\n\ndef set_value(element, name, value):\n    p = element.LookupParameter(name)\n    if p is None or p.IsReadOnly:\n        raise ValueError('Parameter \"{}\" is missing or read-only on element {}.'.format(name, eid_value(element.Id)))\n    p.Set(value)\n\n\ndef schedulable_by_name(definition, doc):\n    result = {}\n    for field in definition.GetSchedulableFields():\n        try:\n            result.setdefault(field.GetName(doc), []).append(field)\n        except Exception:\n            pass\n    return result\n\n\ndef replace_schedule(doc, phase):\n    existing = next((v for v in FilteredElementCollector(doc).OfClass(ViewSchedule)\n                     if not v.IsTemplate and v.Name == SCHEDULE_NAME), None)\n    if existing is not None:\n        doc.Delete(existing.Id)\n    schedule = ViewSchedule.CreateSchedule(doc, ElementId(BuiltInCategory.OST_FabricationPipework))\n    schedule.Name = SCHEDULE_NAME\n    definition = schedule.Definition\n    available = schedulable_by_name(definition, doc)\n\n    def add(name, heading=None):\n        choices = available.get(name, [])\n        if not choices:\n            raise ValueError('Schedule field is unavailable: ' + name)\n        field = definition.AddField(choices[0])\n        if heading:\n            field.ColumnHeading = heading\n        return field\n\n    assembly = add(ASSEMBLY, 'Assembly ID')\n    add(ASSEMBLY_NAME, 'Assembly Name')\n    service_choices = available.get('Service Abbreviation', [])\n    if service_choices:\n        add('Service Abbreviation', 'Service')\n    count_choices = [x for x in definition.GetSchedulableFields()\n                     if x.FieldType == ScheduleFieldType.Count]\n    if not count_choices:\n        raise ValueError('The Fabrication Pipework schedule does not expose a Count field.')\n    count = definition.AddField(count_choices[0])\n    count.ColumnHeading = 'Piece Count'\n    add(TOTAL_WEIGHT, 'Total Weight')\n    phase_field = None\n    phase_parameter = ElementId(BuiltInParameter.PHASE_CREATED)\n    for schedulable in definition.GetSchedulableFields():\n        if schedulable.ParameterId == phase_parameter:\n            phase_field = definition.AddField(schedulable)\n            phase_field.IsHidden = True\n            break\n    if phase_field is None:\n        raise ValueError('The schedule does not expose the Phase Created field.')\n    definition.IsItemized = False\n    definition.AddSortGroupField(ScheduleSortGroupField(assembly.FieldId))\n    definition.AddFilter(ScheduleFilter(phase_field.FieldId, ScheduleFilterType.Equal, phase.Id))\n    definition.AddFilter(ScheduleFilter(assembly.FieldId, ScheduleFilterType.HasValue))\n    return schedule\n\n\ndef select_package(packages):\n    \"\"\"Modal searchable package picker hosted by Revit's UI thread.\"\"\"\n    clr.AddReference('System.Windows.Forms')\n    clr.AddReference('System.Drawing')\n    from System.Drawing import Point, Size\n    from System.Windows.Forms import (AutoCompleteMode, AutoCompleteSource, Button,\n        ComboBox, ComboBoxStyle, DialogResult, Form, FormBorderStyle, Label,\n        FormStartPosition)\n\n    form = Form()\n    form.Text = 'STRATUS Assembly Weight Report'\n    form.ClientSize = Size(500, 155)\n    form.FormBorderStyle = FormBorderStyle.FixedDialog\n    form.MaximizeBox = False\n    form.MinimizeBox = False\n    form.ShowInTaskbar = False\n    form.TopMost = True\n    form.StartPosition = FormStartPosition.CenterScreen\n\n    label = Label()\n    label.Text = 'Select the STRATUS package name for the Excel report:'\n    label.AutoSize = True\n    label.Location = Point(20, 20)\n    form.Controls.Add(label)\n\n    combo = ComboBox()\n    combo.Location = Point(20, 50)\n    combo.Size = Size(460, 28)\n    combo.DropDownStyle = ComboBoxStyle.DropDown\n    combo.AutoCompleteMode = AutoCompleteMode.SuggestAppend\n    combo.AutoCompleteSource = AutoCompleteSource.ListItems\n    for value in packages:\n        combo.Items.Add(value)\n    if packages:\n        combo.SelectedIndex = 0\n    form.Controls.Add(combo)\n\n    ok = Button()\n    ok.Text = 'Create report'\n    ok.Location = Point(276, 103)\n    ok.Size = Size(110, 30)\n    ok.DialogResult = DialogResult.OK\n    form.AcceptButton = ok\n    form.Controls.Add(ok)\n\n    cancel = Button()\n    cancel.Text = 'Cancel'\n    cancel.Location = Point(395, 103)\n    cancel.Size = Size(85, 30)\n    cancel.DialogResult = DialogResult.Cancel\n    form.CancelButton = cancel\n    form.Controls.Add(cancel)\n\n    accepted = form.ShowDialog() == DialogResult.OK\n    selected = combo.Text\n    form.Dispose()\n    if not accepted:\n        return None\n    if selected not in packages:\n        raise ValueError('Select a package from the available STRATUS Package Name values.')\n    return selected\n\n\ndef excel_path(folder, package):\n    base = folder.strip() if folder and folder.strip() else os.path.expanduser('~/Downloads')\n    if not os.path.isdir(base):\n        raise ValueError('Excel folder does not exist: ' + base)\n    safe = re.sub(r'[<>:\"/\\\\|?*\\x00-\\x1f]', '_', package).strip(' .') or 'Package'\n    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H%M%S')\n    candidate = os.path.join(base, 'STRATUS Weight Report - {} - {}.xlsx'.format(safe, timestamp))\n    if not os.path.exists(candidate):\n        return candidate\n    number = 2\n    while True:\n        alternate = os.path.join(base, 'STRATUS Weight Report - {} - {} - {}.xlsx'.format(\n            safe, timestamp, number))\n        if not os.path.exists(alternate):\n            return alternate\n        number += 1\n\n\ndef xml_text(value):\n    value = str(value)\n    return (value.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')\n            .replace('\"', '&quot;').replace(\"'\", '&apos;'))\n\n\ndef xlsx_cell(reference, value, style=0, numeric=False):\n    if numeric:\n        return '<c r=\"{}\" s=\"{}\"><v>{}</v></c>'.format(reference, style, value)\n    return '<c r=\"{}\" s=\"{}\" t=\"inlineStr\"><is><t xml:space=\"preserve\">{}</t></is></c>'.format(\n        reference, style, xml_text(value))\n\n\ndef export_excel(groups, package, folder):\n    \"\"\"Create a two-sheet XLSX with weight summary and connector audit.\"\"\"\n    selected = [g for g in groups.values() if package in g['packages']]\n    selected.sort(key=lambda g: (-g['actual_weight_lbm'], g['assembly_id']))\n    if not selected:\n        raise ValueError('No eligible assemblies were found for package: ' + package)\n    path = excel_path(folder, package)\n    generated = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')\n    total_pieces = sum(g['piece_count'] for g in selected)\n    total_weight = sum(g['total_weight_lbm'] for g in selected)\n    total_actual_weight = sum(g['actual_weight_lbm'] for g in selected)\n    rows = [\n        '<row r=\"2\" ht=\"24\" customHeight=\"1\">{}</row>'.format(\n            xlsx_cell('A2', 'STRATUS Assembly Weight Report', 1)),\n        '<row r=\"3\">{}{}</row>'.format(xlsx_cell('A3', 'Generated', 2), xlsx_cell('B3', generated, 3)),\n        '<row r=\"4\">{}{}</row>'.format(xlsx_cell('A4', 'Package', 2), xlsx_cell('B4', package, 3)),\n        '<row r=\"5\">{}{}{}{}</row>'.format(\n            xlsx_cell('A5', 'Assembly Count', 2), xlsx_cell('B5', len(selected), 3, True),\n            xlsx_cell('D5', 'Total Piece Count', 2), xlsx_cell('E5', total_pieces, 3, True)),\n        '<row r=\"6\">{}{}</row>'.format(\n            xlsx_cell('A6', 'Combined Gross Weight (lbm)', 2),\n            xlsx_cell('B6', round(total_weight, 3), 6, True)),\n        '<row r=\"7\">{}{}</row>'.format(\n            xlsx_cell('A7', 'Combined Actual Weight (lbm)', 2),\n            xlsx_cell('B7', round(total_actual_weight, 3), 6, True)),\n        '<row r=\"9\" ht=\"30\" customHeight=\"1\">{}</row>'.format(''.join([\n            xlsx_cell('A9', 'STRATUS Package Name', 4), xlsx_cell('B9', 'Assembly Name', 4),\n            xlsx_cell('C9', 'Service', 4), xlsx_cell('D9', 'Piece Count', 4),\n            xlsx_cell('E9', 'Gross Weight (lbm)', 4),\n            xlsx_cell('F9', 'Actual Weight (lbm)', 4)]))]\n    for index, group in enumerate(selected, 10):\n        rows.append('<row r=\"{}\">{}</row>'.format(index, ''.join([\n            xlsx_cell('A{}'.format(index), package, 5),\n            xlsx_cell('B{}'.format(index), group['assembly_name'], 5),\n            xlsx_cell('C{}'.format(index), group['service'], 5),\n            xlsx_cell('D{}'.format(index), group['piece_count'], 7, True),\n            xlsx_cell('E{}'.format(index), round(group['total_weight_lbm'], 3), 6, True),\n            xlsx_cell('F{}'.format(index), round(group['actual_weight_lbm'], 3), 6, True)])))\n    last = 9 + len(selected)\n    sheet = '''<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\n<sheetViews><sheetView showGridLines=\"0\" workbookViewId=\"0\"><pane ySplit=\"9\" topLeftCell=\"A10\" activePane=\"bottomLeft\" state=\"frozen\"/></sheetView></sheetViews>\n<cols><col min=\"1\" max=\"2\" width=\"27\" customWidth=\"1\"/><col min=\"3\" max=\"3\" width=\"16\" customWidth=\"1\"/><col min=\"4\" max=\"4\" width=\"14\" customWidth=\"1\"/><col min=\"5\" max=\"6\" width=\"22\" customWidth=\"1\"/></cols>\n<sheetData>{rows}</sheetData>\n<autoFilter ref=\"A9:F{last}\"/>\n<conditionalFormatting sqref=\"F10:F{last}\"><cfRule type=\"colorScale\" priority=\"1\"><colorScale><cfvo type=\"min\"/><cfvo type=\"percentile\" val=\"50\"/><cfvo type=\"max\"/><color rgb=\"FFFFF2CC\"/><color rgb=\"FFF4B183\"/><color rgb=\"FF9C0006\"/></colorScale></cfRule></conditionalFormatting>\n<pageMargins left=\"0.4\" right=\"0.4\" top=\"0.6\" bottom=\"0.6\" header=\"0.2\" footer=\"0.2\"/>\n</worksheet>'''.format(rows=''.join(rows), last=last)\n    styles = '''<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\n<fonts count=\"4\"><font><sz val=\"10\"/><name val=\"Arial\"/></font><font><b/><sz val=\"14\"/><color rgb=\"FF1F1F1F\"/><name val=\"Arial\"/></font><font><b/><sz val=\"10\"/><color rgb=\"FF404040\"/><name val=\"Arial\"/></font><font><b/><sz val=\"10\"/><color rgb=\"FFFFFFFF\"/><name val=\"Arial\"/></font></fonts>\n<fills count=\"3\"><fill><patternFill patternType=\"none\"/></fill><fill><patternFill patternType=\"gray125\"/></fill><fill><patternFill patternType=\"solid\"><fgColor rgb=\"FF1F4E78\"/><bgColor indexed=\"64\"/></patternFill></fill></fills>\n<borders count=\"2\"><border><left/><right/><top/><bottom/><diagonal/></border><border><left/><right/><top/><bottom style=\"thin\"><color rgb=\"FFD9E2F3\"/></bottom><diagonal/></border></borders>\n<numFmts count=\"1\"><numFmt numFmtId=\"164\" formatCode=\"#,##0.000\"/></numFmts>\n<cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>\n<cellXfs count=\"9\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/><xf numFmtId=\"0\" fontId=\"1\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyFont=\"1\" applyBorder=\"1\"/><xf numFmtId=\"0\" fontId=\"2\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/><xf numFmtId=\"0\" fontId=\"3\" fillId=\"2\" borderId=\"0\" xfId=\"0\" applyFont=\"1\" applyFill=\"1\" applyAlignment=\"1\"><alignment horizontal=\"center\" vertical=\"center\" wrapText=\"1\"/></xf><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyBorder=\"1\"/><xf numFmtId=\"164\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/><xf numFmtId=\"3\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"><alignment wrapText=\"0\"/></xf></cellXfs>\n<cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles>\n</styleSheet>'''\n    content_types = '''<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/><Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/><Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/><Override PartName=\"/docProps/core.xml\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/><Override PartName=\"/docProps/app.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.extended-properties+xml\"/></Types>'''\n    root_rels = '''<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/><Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"docProps/core.xml\"/><Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties\" Target=\"docProps/app.xml\"/></Relationships>'''\n    workbook = '''<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets><sheet name=\"Package Weight Report\" sheetId=\"1\" r:id=\"rId1\"/></sheets><calcPr calcId=\"191029\" fullCalcOnLoad=\"1\"/></workbook>'''\n    workbook_rels = '''<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/><Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/></Relationships>'''\n    core = '''<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"><dc:title>STRATUS Assembly Weight Report</dc:title><dc:creator>Dynamo</dc:creator><dcterms:created xsi:type=\"dcterms:W3CDTF\">{}</dcterms:created></cp:coreProperties>'''.format(datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))\n    app_xml = '''<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\" xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\"><Application>Microsoft Excel</Application></Properties>'''\n    with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as archive:\n        for name, data in [('[Content_Types].xml', content_types), ('_rels/.rels', root_rels),\n                           ('xl/workbook.xml', workbook), ('xl/_rels/workbook.xml.rels', workbook_rels),\n                           ('xl/worksheets/sheet1.xml', sheet), ('xl/styles.xml', styles),\n                           ('docProps/core.xml', core), ('docProps/app.xml', app_xml)]:\n            archive.writestr(name, data.encode('utf-8'))\n    return path, len(selected)\n\n\ndef summary(groups):\n    return [{'Assembly ID': g['assembly_id'], 'Assembly Name': g['assembly_name'],\n             'Service': g['service'], 'Piece Count': g['piece_count'],\n             'Gross Weight (lbm)': round(g['total_weight_lbm'], 3),\n             'Excluded Coupling Count': len(g['excluded_couplings']),\n             'Coupling Adjustment (lbm)': round(g['coupling_adjustment_lbm'], 3),\n             'Actual Weight (lbm)': round(g['actual_weight_lbm'], 3)}\n            for g in groups.values()]\n\n\ndef main(apply_changes, do_export, folder):\n    uiapp = DocumentManager.Instance.CurrentUIApplication\n    app = uiapp.Application\n    doc = DocumentManager.Instance.CurrentDBDocument\n    if doc.IsFamilyDocument:\n        raise ValueError('Open a Revit project model, not a family document.')\n    groups, skipped, phase, packages = collect(doc)\n    selected_package = None\n    export_cancelled = False\n    if do_export:\n        if not packages:\n            raise ValueError('No nonblank STRATUS Package Name values were found on eligible parts.')\n        selected_package = select_package(packages)\n        export_cancelled = selected_package is None\n    result = {'status': 'Preview only; set Apply changes to True.',\n              'phase': phase.Name, 'schedule': SCHEDULE_NAME,\n              'assemblies': summary(groups), 'skipped': skipped,\n              'notes': ['Assembly IDs are matched exactly, including case and whitespace.',\n                        'Assembly Name currently copies STRATUS Assembly.',\n                        'Only Fabrication Pipework created in New Construction is included; hangers are excluded.',\n                        'Separately modeled parts whose description contains \"coupl\" are deducted from Gross Weight to calculate Actual Weight.']}\n    if selected_package:\n        result['selected_package'] = selected_package\n        result['package_assemblies'] = summary(OrderedDict(\n            (key, value) for key, value in groups.items() if selected_package in value['packages']))\n    elif export_cancelled:\n        result['excel'] = 'Cancelled; Revit processing will continue if Apply changes is True.'\n    if not groups:\n        result['status'] = 'No eligible Fabrication Pipework found.'\n        return result\n    if not apply_changes:\n        return result\n\n    manager = TransactionManager.Instance\n    manager.EnsureInTransaction(doc)\n    sub = SubTransaction(doc)\n    sub.Start()\n    try:\n        ensure_parameters(doc, app)\n        doc.Regenerate()\n        for group in groups.values():\n            total_internal = UnitUtils.ConvertToInternalUnits(group['actual_weight_lbm'], UnitTypeId.PoundsMass)\n            for element in group['elements']:\n                set_value(element, ASSEMBLY_NAME, group['assembly_name'])\n                set_value(element, PIECE_COUNT, group['piece_count'])\n                set_value(element, TOTAL_WEIGHT, total_internal)\n        schedule = replace_schedule(doc, phase)\n        result['schedule_id'] = eid_value(schedule.Id)\n        if sub.Commit() != TransactionStatus.Committed:\n            raise RuntimeError('Revit did not commit the STRATUS report changes.')\n    except Exception:\n        if sub.GetStatus() == TransactionStatus.Started:\n            sub.RollBack()\n        raise\n    finally:\n        manager.TransactionTaskDone()\n\n    result['status'] = 'Updated {} assemblies and created schedule \"{}\".'.format(len(groups), SCHEDULE_NAME)\n    if selected_package:\n        try:\n            path, row_count = export_excel(groups, selected_package, folder)\n            result['excel'] = path\n            result['excel_assembly_count'] = row_count\n        except Exception as excel_error:\n            result['excel_error'] = str(excel_error)\n            result['status'] += ' Revit succeeded, but Excel creation failed.'\n    return result\n\n\ntry:\n    _apply = bool(IN[0]) if IN and len(IN) > 0 and IN[0] is not None else False\n    _export = bool(IN[1]) if IN and len(IN) > 1 and IN[1] is not None else False\n    _folder = str(IN[2]) if IN and len(IN) > 2 and IN[2] is not None else ''\n    _run_trigger = IN[3] if IN and len(IN) > 3 else None\n    OUT = main(_apply, _export, _folder)\nexcept Exception as error:\n    OUT = {'status': 'Stopped', 'error': str(error)}\n",
+      "Engine": "CPython3",
+      "VariableInputPorts": true,
+      "Id": "78ced8d8ede85ef78e4152f1bd897650",
+      "Inputs": [
+        {
+          "Id": "a017010c67875291b9dd74bd85abf224",
+          "Name": "IN[0]",
+          "Description": "IN[0]",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "eb176c8b604f5f0d8e0aca36c3cfd066",
+          "Name": "IN[1]",
+          "Description": "IN[1]",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "efb53de83073509dba4fc6f729b3e1a3",
+          "Name": "IN[2]",
+          "Description": "IN[2]",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "68d401fec71656d0aeb7810dc1cc899e",
+          "Name": "IN[3]",
+          "Description": "IN[3]",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "1ff3cd8b9c5c5a55baec3e4f1e109f24",
+          "Name": "OUT",
+          "Description": "OUT",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Project-wide STRATUS assembly weight reporting."
+    },
+    {
+      "ConcreteType": "CoreNodeModels.Watch, CoreNodeModels",
+      "NodeType": "ExtensionNode",
+      "Id": "d33d93e0ab2354669b554f5ad419d3f7",
+      "Inputs": [
+        {
+          "Id": "405644f84b5f5867b68cacea9c59c71e",
+          "Name": "",
+          "Description": "",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "9a1f80edbc375de7badae0fcf639d826",
+          "Name": "",
+          "Description": "",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Preview, results, skipped counts and errors."
+    }
+  ],
+  "Connectors": [
+    {
+      "Start": "14ead72ea28d5e949bd3d86e1d282bc2",
+      "End": "a017010c67875291b9dd74bd85abf224",
+      "Id": "147669b53cdd5152b96c2d2eb10ba091",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "8ad656291420530e8a0c62d6553a10e5",
+      "End": "eb176c8b604f5f0d8e0aca36c3cfd066",
+      "Id": "75b0ba3d01cc5dcba3c5741180287be0",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "b8f11eb1ed9758618342942aabc4d524",
+      "End": "efb53de83073509dba4fc6f729b3e1a3",
+      "Id": "53a67bab79585873adab17a0ffe8dabe",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "8299b132d8fd57058d43c72b42fbc6e4",
+      "End": "68d401fec71656d0aeb7810dc1cc899e",
+      "Id": "180919cacf315a908a53e447573ca6fa",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "1ff3cd8b9c5c5a55baec3e4f1e109f24",
+      "End": "405644f84b5f5867b68cacea9c59c71e",
+      "Id": "e126b8520e5153c2b350e382aa213873",
+      "IsHidden": "False"
+    }
+  ],
+  "Dependencies": [],
+  "NodeLibraryDependencies": [],
+  "Bindings": [],
+  "View": {
+    "Dynamo": {
+      "ScaleFactor": 1.0,
+      "HasRunWithoutCrash": false,
+      "IsVisibleInDynamoLibrary": true,
+      "Version": "3.0.3.7597",
+      "RunType": "Manual",
+      "RunPeriod": "1000"
+    },
+    "NodeViews": [
+      {
+        "Id": "b2579cfcd50e5f1e8dd8701238b5d1f7",
+        "Name": "Apply changes (False = preview)",
+        "IsSetAsInput": true,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": false,
+        "X": 0.0,
+        "Y": 50.0
+      },
+      {
+        "Id": "cc86b81af3cf583f915f1b32024e9a7d",
+        "Name": "Create package Excel report",
+        "IsSetAsInput": true,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": false,
+        "X": 0.0,
+        "Y": 170.0
+      },
+      {
+        "Id": "650d5231c2995fcd8c76f42a67c0cdb9",
+        "Name": "Excel folder (blank = Downloads)",
+        "IsSetAsInput": true,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": false,
+        "X": 0.0,
+        "Y": 290.0
+      },
+      {
+        "Id": "b47083f6792b5485b903f1cf12cc80c8",
+        "Name": "Run trigger (automatic)",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": false,
+        "X": 200.0,
+        "Y": 410.0
+      },
+      {
+        "Id": "78ced8d8ede85ef78e4152f1bd897650",
+        "Name": "STRATUS Assembly Weight Reporting",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": false,
+        "X": 410.0,
+        "Y": 150.0
+      },
+      {
+        "Id": "d33d93e0ab2354669b554f5ad419d3f7",
+        "Name": "Results / diagnostics",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": true,
+        "Excluded": false,
+        "ShowGeometry": false,
+        "X": 800.0,
+        "Y": 150.0
+      }
+    ],
+    "Annotations": [],
+    "X": 40.0,
+    "Y": 80.0,
+    "Zoom": 0.85
+  }
+}

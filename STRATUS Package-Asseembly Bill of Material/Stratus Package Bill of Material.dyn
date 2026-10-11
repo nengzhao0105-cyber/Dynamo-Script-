@@ -1,0 +1,266 @@
+{
+  "Uuid": "b5f35648-0472-540d-ac35-5a43f9186122",
+  "IsCustomNode": false,
+  "Description": "Revit 2025 package BOM schedule with separate fitting and pipe Excel tabs.",
+  "Name": "Stratus Package Bill of Material",
+  "ElementResolver": {
+    "ResolutionMap": {}
+  },
+  "Inputs": [
+    {
+      "Id": "28400e43173654fabcccfc058184d073",
+      "Name": "Apply and create BOM (False = preview)",
+      "Type": "boolean",
+      "Type2": "boolean",
+      "Value": "true",
+      "Description": "Enables selection between True and False"
+    },
+    {
+      "Id": "5f455f916b175e5a9d320aae53eb480d",
+      "Name": "Excel folder (blank = Downloads)",
+      "Type": "string",
+      "Type2": "string",
+      "Value": "",
+      "Description": "Creates a string"
+    }
+  ],
+  "Outputs": [
+    {
+      "Id": "fa1616621d6a555d8fee889370ba1d61",
+      "Name": "Results / diagnostics",
+      "Type": "unknown",
+      "InitialValue": "",
+      "Description": "Visualizes a node's output"
+    }
+  ],
+  "Nodes": [
+    {
+      "ConcreteType": "CoreNodeModels.Input.BoolSelector, CoreNodeModels",
+      "Id": "28400e43173654fabcccfc058184d073",
+      "NodeType": "BooleanInputNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "4012ac493a58580aa3e04f57eec04d00",
+          "Name": "",
+          "Description": "",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Enables selection between True and False",
+      "InputValue": true
+    },
+    {
+      "ConcreteType": "CoreNodeModels.Input.StringInput, CoreNodeModels",
+      "Id": "5f455f916b175e5a9d320aae53eb480d",
+      "NodeType": "StringInputNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "f7b49a7e83045f909cd8132ddf0e11a5",
+          "Name": "",
+          "Description": "",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Creates a string",
+      "InputValue": ""
+    },
+    {
+      "ConcreteType": "PythonNodeModels.PythonNode, PythonNodeModels",
+      "Code": "\"\"\"Dynamo CPython3 / Revit 2025.\n\nIN[0]: Apply changes (False = preview)\nIN[1]: Excel folder (blank = Downloads)\n\"\"\"\nimport clr\nimport datetime\nimport os\nimport re\nimport tempfile\nimport zipfile\nfrom collections import OrderedDict\nfrom System import Guid\n\nclr.AddReference('RevitAPI')\nclr.AddReference('RevitServices')\nfrom Autodesk.Revit.DB import (\n    BuiltInCategory, BuiltInParameter, Category, ElementId,\n    ExternalDefinitionCreationOptions, FilteredElementCollector,\n    ScheduleFieldDisplayType, ScheduleFieldType, ScheduleFilter, ScheduleFilterType,\n    ScheduleSortGroupField, SpecTypeId, StorageType, SubTransaction,\n    TransactionStatus, UnitTypeId, UnitUtils, ViewSchedule, FabricationPart\n)\nfrom RevitServices.Persistence import DocumentManager\nfrom RevitServices.Transactions import TransactionManager\n\nPACKAGE = 'STRATUS Package Name'\nASSEMBLY = 'STRATUS Assembly'\nSCHEDULE_NAME = 'Stratus Package Bill of Material'\nPHASE_NAME = 'New Construction'\nBOM_CLASS = 'Stratus BOM Category'\nBOM_DESCRIPTION = 'Stratus BOM Description'\nBOM_SIZE = 'Stratus BOM Size'\nBOM_LENGTH = 'Stratus BOM Total Length'\n\nPARAMETERS = OrderedDict([\n    (BOM_CLASS, (Guid('b215b4cb-4f28-405c-a332-1b72d2ed2201'), SpecTypeId.String.Text)),\n    (BOM_DESCRIPTION, (Guid('b215b4cb-4f28-405c-a332-1b72d2ed2202'), SpecTypeId.String.Text)),\n    (BOM_SIZE, (Guid('b215b4cb-4f28-405c-a332-1b72d2ed2203'), SpecTypeId.String.Text)),\n    (BOM_LENGTH, (Guid('b215b4cb-4f28-405c-a332-1b72d2ed2204'), SpecTypeId.Length)),\n])\n\nDESCRIPTION_FIELDS = ('Family', 'Item Name', 'Product Name', 'Product Entry', 'Family Name')\nSIZE_FIELDS = ('Size', 'Product Size')\nLENGTH_FIELDS = ('Length', 'Cut Length')\nEXCLUDED_DESCRIPTION_TEXT = ('shop weld bw', 'shop cs')\n\n\ndef eid_value(eid):\n    return eid.Value if hasattr(eid, 'Value') else eid.IntegerValue\n\n\ndef parameter_text(element, name):\n    p = element.LookupParameter(name)\n    if p is None:\n        return None\n    value = p.AsString() if p.StorageType == StorageType.String else p.AsValueString()\n    return value.strip() if value and value.strip() else None\n\n\ndef first_parameter_text(element, names):\n    for name in names:\n        value = parameter_text(element, name)\n        if value:\n            return value, name\n    return None, None\n\n\ndef is_straight_pipe(part):\n    \"\"\"Use the FabricationPart type first, with content-text fallbacks.\"\"\"\n    try:\n        if part.IsAStraight():\n            return True\n    except Exception:\n        pass\n    try:\n        if str(part.PartType).lower() == 'straight':\n            return True\n    except Exception:\n        pass\n    for name in ('Part Type', 'Item Type'):\n        value = parameter_text(part, name)\n        if value and value.lower() in ('straight', 'straight pipe', 'pipe', 'tube'):\n            return True\n    return False\n\n\ndef length_internal(part):\n    \"\"\"Return Revit internal length for straight pipe, or an explanatory error.\"\"\"\n    for name in LENGTH_FIELDS:\n        p = part.LookupParameter(name)\n        if p is not None and p.StorageType == StorageType.Double:\n            return p.AsDouble(), None\n    try:\n        value = part.CenterlineLength\n        if value is not None:\n            return float(value), None\n    except Exception:\n        pass\n    return None, 'missing or unreadable Length'\n\n\ndef collect(doc):\n    phase_matches = [p for p in doc.Phases if p.Name == PHASE_NAME]\n    if len(phase_matches) != 1:\n        raise ValueError('Expected exactly one phase named \"{}\"; found {}.'.format(\n            PHASE_NAME, len(phase_matches)))\n    phase = phase_matches[0]\n    records = []\n    packages = set()\n    assemblies = set()\n    skipped = {'wrong_phase': 0, 'blank_package_and_assembly': 0, 'excluded_shop_item': 0,\n               'missing_description': 0,\n               'missing_size': 0, 'missing_pipe_length': 0}\n    description_sources = set()\n    size_sources = set()\n    parts = (FilteredElementCollector(doc)\n             .OfCategory(BuiltInCategory.OST_FabricationPipework)\n             .WhereElementIsNotElementType())\n    for part in parts:\n        if not isinstance(part, FabricationPart):\n            continue\n        if eid_value(part.CreatedPhaseId) != eid_value(phase.Id):\n            skipped['wrong_phase'] += 1\n            continue\n        if (part.DemolishedPhaseId != ElementId.InvalidElementId and\n                eid_value(part.DemolishedPhaseId) == eid_value(phase.Id)):\n            skipped['wrong_phase'] += 1\n            continue\n        package = parameter_text(part, PACKAGE)\n        assembly = parameter_text(part, ASSEMBLY)\n        if not package and not assembly:\n            skipped['blank_package_and_assembly'] += 1\n            continue\n        description, description_source = first_parameter_text(part, DESCRIPTION_FIELDS)\n        size, size_source = first_parameter_text(part, SIZE_FIELDS)\n        if description and any(text in description.lower() for text in EXCLUDED_DESCRIPTION_TEXT):\n            skipped['excluded_shop_item'] += 1\n            continue\n        if not description:\n            description = '<Missing description>'\n            skipped['missing_description'] += 1\n        else:\n            description_sources.add(description_source)\n        if not size:\n            size = '<Missing size>'\n            skipped['missing_size'] += 1\n        else:\n            size_sources.add(size_source)\n        category = 'Pipe' if is_straight_pipe(part) else 'Fitting'\n        length = 0.0\n        if category == 'Pipe':\n            length, error = length_internal(part)\n            if error:\n                skipped['missing_pipe_length'] += 1\n                length = 0.0\n        if package:\n            packages.add(package)\n        if assembly:\n            assemblies.add(assembly)\n        records.append({'element': part, 'package': package, 'assembly': assembly,\n                        'category': category, 'description': description, 'size': size,\n                        'length_internal': length})\n    return (records, sorted(packages), sorted(assemblies), skipped, phase,\n            sorted(description_sources), sorted(size_sources))\n\n\ndef aggregate(records, packages, assemblies):\n    selected_packages = set(packages)\n    selected_assemblies = set(assemblies)\n    fittings = OrderedDict()\n    pipe = OrderedDict()\n    for record in records:\n        if (record['package'] not in selected_packages and\n                record['assembly'] not in selected_assemblies):\n            continue\n        key = (record['description'], record['size'])\n        target = pipe if record['category'] == 'Pipe' else fittings\n        row = target.setdefault(key, {'description': key[0], 'size': key[1],\n                                     'count': 0, 'length_internal': 0.0})\n        row['count'] += 1\n        row['length_internal'] += record['length_internal']\n    fitting_rows = sorted(fittings.values(), key=lambda x: (x['description'].lower(), x['size'].lower()))\n    pipe_rows = sorted(pipe.values(), key=lambda x: (x['description'].lower(), x['size'].lower()))\n    return fitting_rows, pipe_rows\n\n\ndef ensure_parameters(doc, app):\n    old_path = app.SharedParametersFilename\n    fd, path = tempfile.mkstemp(prefix='stratus_bom_', suffix='.txt')\n    os.close(fd)\n    try:\n        with open(path, 'w') as shared:\n            shared.write('# This is a Revit shared parameter file.\\n')\n            shared.write('*META\\tVERSION\\tMINVERSION\\nMETA\\t2\\t1\\n')\n            shared.write('*GROUP\\tID\\tNAME\\n')\n            shared.write('*PARAM\\tGUID\\tNAME\\tDATATYPE\\tDATACATEGORY\\tGROUP\\tVISIBLE\\tDESCRIPTION\\tUSERMODIFIABLE\\tHIDEWHENNOVALUE\\n')\n        app.SharedParametersFilename = path\n        definition_file = app.OpenSharedParameterFile()\n        group = definition_file.Groups.Create('Dynamo Stratus BOM')\n        categories = app.Create.NewCategorySet()\n        categories.Insert(Category.GetCategory(doc, BuiltInCategory.OST_FabricationPipework))\n        binding = app.Create.NewInstanceBinding(categories)\n        existing = set()\n        iterator = doc.ParameterBindings.ForwardIterator()\n        iterator.Reset()\n        while iterator.MoveNext():\n            existing.add(iterator.Key.Name)\n        for name, (guid, data_type) in PARAMETERS.items():\n            if name in existing:\n                continue\n            options = ExternalDefinitionCreationOptions(name, data_type)\n            options.GUID = guid\n            definition = group.Definitions.Create(options)\n            if not doc.ParameterBindings.Insert(definition, binding):\n                raise RuntimeError('Could not create project parameter: ' + name)\n    finally:\n        app.SharedParametersFilename = old_path\n        try:\n            os.remove(path)\n        except Exception:\n            pass\n\n\ndef set_value(element, name, value):\n    p = element.LookupParameter(name)\n    if p is None or p.IsReadOnly:\n        raise ValueError('Parameter \"{}\" is missing or read-only on element {}.'.format(\n            name, eid_value(element.Id)))\n    p.Set(value)\n\n\ndef schedulable_by_name(definition, doc):\n    result = {}\n    for field in definition.GetSchedulableFields():\n        try:\n            result.setdefault(field.GetName(doc), []).append(field)\n        except Exception:\n            pass\n    return result\n\n\ndef replace_schedule(doc, phase):\n    existing = [v for v in FilteredElementCollector(doc).OfClass(ViewSchedule)\n                if not v.IsTemplate and v.Name == SCHEDULE_NAME]\n    for schedule in existing:\n        doc.Delete(schedule.Id)\n    schedule = ViewSchedule.CreateSchedule(doc, ElementId(BuiltInCategory.OST_FabricationPipework))\n    schedule.Name = SCHEDULE_NAME\n    definition = schedule.Definition\n    available = schedulable_by_name(definition, doc)\n\n    def add(name, heading=None):\n        choices = available.get(name, [])\n        if not choices:\n            raise ValueError('Schedule field is unavailable: ' + name)\n        field = definition.AddField(choices[0])\n        if heading:\n            field.ColumnHeading = heading\n        return field\n\n    package = add(PACKAGE, 'Package')\n    assembly = add(ASSEMBLY, 'Assembly')\n    category = add(BOM_CLASS, 'Type')\n    description = add(BOM_DESCRIPTION, 'Description')\n    size = add(BOM_SIZE, 'Size')\n    count_choices = [x for x in definition.GetSchedulableFields()\n                     if x.FieldType == ScheduleFieldType.Count]\n    if not count_choices:\n        raise ValueError('Fabrication Pipework does not expose a schedule Count field.')\n    count = definition.AddField(count_choices[0])\n    count.ColumnHeading = 'Count'\n    length = add(BOM_LENGTH, 'Total Length')\n    length.DisplayType = ScheduleFieldDisplayType.Totals\n    phase_field = None\n    phase_id = ElementId(BuiltInParameter.PHASE_CREATED)\n    for schedulable in definition.GetSchedulableFields():\n        if schedulable.ParameterId == phase_id:\n            phase_field = definition.AddField(schedulable)\n            phase_field.IsHidden = True\n            break\n    if phase_field is None:\n        raise ValueError('The schedule does not expose Phase Created.')\n    definition.IsItemized = False\n    for field in (package, assembly, category, description, size):\n        definition.AddSortGroupField(ScheduleSortGroupField(field.FieldId))\n    definition.AddFilter(ScheduleFilter(phase_field.FieldId, ScheduleFilterType.Equal, phase.Id))\n    definition.AddFilter(ScheduleFilter(category.FieldId, ScheduleFilterType.HasValue))\n    return schedule\n\n\ndef select_scope(packages, assemblies):\n    clr.AddReference('System.Windows.Forms')\n    clr.AddReference('System.Drawing')\n    from System.Drawing import Point, Size\n    from System.Windows.Forms import (AutoCompleteMode, AutoCompleteSource, Button,\n        ComboBox, ComboBoxStyle, DialogResult, Form, FormBorderStyle, Label,\n        FormStartPosition)\n    selected_packages = set()\n    selected_assemblies = set()\n    note_text = 'Type to search, choose an exact value, then add it to the order.'\n\n    while True:\n        form = Form()\n        form.Text = SCHEDULE_NAME\n        form.ClientSize = Size(760, 390)\n        form.FormBorderStyle = FormBorderStyle.FixedDialog\n        form.MaximizeBox = False\n        form.MinimizeBox = False\n        form.ShowInTaskbar = False\n        form.TopMost = True\n        form.StartPosition = FormStartPosition.CenterScreen\n        label = Label()\n        label.Text = note_text\n        label.AutoSize = True\n        label.Location = Point(20, 15)\n        form.Controls.Add(label)\n\n        package_label = Label()\n        package_label.Text = 'Search packages'\n        package_label.AutoSize = True\n        package_label.Location = Point(20, 50)\n        form.Controls.Add(package_label)\n        package_combo = ComboBox()\n        package_combo.Location = Point(20, 75)\n        package_combo.Size = Size(345, 28)\n        package_combo.DropDownStyle = ComboBoxStyle.DropDown\n        package_combo.AutoCompleteMode = AutoCompleteMode.SuggestAppend\n        package_combo.AutoCompleteSource = AutoCompleteSource.ListItems\n        for value in packages:\n            package_combo.Items.Add(value)\n        form.Controls.Add(package_combo)\n        add_package = Button()\n        add_package.Text = 'Add package'\n        add_package.Location = Point(255, 112)\n        add_package.Size = Size(110, 30)\n        add_package.DialogResult = DialogResult.Retry\n        form.Controls.Add(add_package)\n\n        assembly_label = Label()\n        assembly_label.Text = 'Search individual assemblies'\n        assembly_label.AutoSize = True\n        assembly_label.Location = Point(395, 50)\n        form.Controls.Add(assembly_label)\n        assembly_combo = ComboBox()\n        assembly_combo.Location = Point(395, 75)\n        assembly_combo.Size = Size(345, 28)\n        assembly_combo.DropDownStyle = ComboBoxStyle.DropDown\n        assembly_combo.AutoCompleteMode = AutoCompleteMode.SuggestAppend\n        assembly_combo.AutoCompleteSource = AutoCompleteSource.ListItems\n        for value in assemblies:\n            assembly_combo.Items.Add(value)\n        form.Controls.Add(assembly_combo)\n        add_assembly = Button()\n        add_assembly.Text = 'Add assembly'\n        add_assembly.Location = Point(630, 112)\n        add_assembly.Size = Size(110, 30)\n        add_assembly.DialogResult = DialogResult.Ignore\n        form.Controls.Add(add_assembly)\n\n        summary = Label()\n        summary.Text = ('Selected packages ({}): {}\\n\\nSelected assemblies ({}): {}'\n                        .format(len(selected_packages),\n                                ', '.join(sorted(selected_packages)) or 'None',\n                                len(selected_assemblies),\n                                ', '.join(sorted(selected_assemblies)) or 'None'))\n        summary.AutoSize = False\n        summary.Location = Point(20, 165)\n        summary.Size = Size(720, 125)\n        form.Controls.Add(summary)\n\n        reset = Button()\n        reset.Text = 'Clear selections'\n        reset.Location = Point(20, 330)\n        reset.Size = Size(120, 30)\n        reset.DialogResult = DialogResult.Abort\n        form.Controls.Add(reset)\n        ok = Button()\n        ok.Text = 'Create BOM'\n        ok.Location = Point(535, 330)\n        ok.Size = Size(110, 30)\n        ok.DialogResult = DialogResult.OK\n        form.AcceptButton = ok\n        form.Controls.Add(ok)\n        cancel = Button()\n        cancel.Text = 'Cancel'\n        cancel.Location = Point(655, 330)\n        cancel.Size = Size(85, 30)\n        cancel.DialogResult = DialogResult.Cancel\n        form.CancelButton = cancel\n        form.Controls.Add(cancel)\n\n        choice = form.ShowDialog()\n        package_value = package_combo.Text.strip()\n        assembly_value = assembly_combo.Text.strip()\n        form.Dispose()\n        if choice == DialogResult.Cancel:\n            return None\n        if choice == DialogResult.Retry:\n            if package_value in packages:\n                selected_packages.add(package_value)\n                note_text = 'Package added. Continue searching or create the BOM.'\n            else:\n                note_text = 'Package not added: choose an exact value from the suggestions.'\n            continue\n        if choice == DialogResult.Ignore:\n            if assembly_value in assemblies:\n                selected_assemblies.add(assembly_value)\n                note_text = 'Assembly added. Continue searching or create the BOM.'\n            else:\n                note_text = 'Assembly not added: choose an exact value from the suggestions.'\n            continue\n        if choice == DialogResult.Abort:\n            selected_packages.clear()\n            selected_assemblies.clear()\n            note_text = 'Selections cleared. Add packages, assemblies, or both.'\n            continue\n        # Create BOM also accepts a valid value currently shown in either field.\n        if package_value in packages:\n            selected_packages.add(package_value)\n        if assembly_value in assemblies:\n            selected_assemblies.add(assembly_value)\n        if not selected_packages and not selected_assemblies:\n            raise ValueError('Select at least one package or individual assembly.')\n        return sorted(selected_packages), sorted(selected_assemblies)\n\n\ndef excel_path(folder, packages):\n    base = folder.strip() if folder and folder.strip() else os.path.expanduser('~/Downloads')\n    if not os.path.isdir(base):\n        raise ValueError('Excel folder does not exist: ' + base)\n    stamp = datetime.datetime.now().strftime('%Y-%m-%d %H%M%S')\n    candidate = os.path.join(base, 'Stratus BOM - {}.xlsx'.format(stamp))\n    if not os.path.exists(candidate):\n        return candidate\n    number = 2\n    while True:\n        alternate = os.path.join(base, 'Stratus BOM - {} - {}.xlsx'.format(stamp, number))\n        if not os.path.exists(alternate):\n            return alternate\n        number += 1\n\n\ndef xml_text(value):\n    return (str(value).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')\n            .replace('\"', '&quot;').replace(\"'\", '&apos;'))\n\n\ndef xlsx_cell(reference, value, style=0, numeric=False):\n    if numeric:\n        return '<c r=\"{}\" s=\"{}\"><v>{}</v></c>'.format(reference, style, value)\n    return '<c r=\"{}\" s=\"{}\" t=\"inlineStr\"><is><t xml:space=\"preserve\">{}</t></is></c>'.format(\n        reference, style, xml_text(value))\n\n\ndef worksheet_xml(title, packages, assemblies, headers, data_rows, pipe_sheet=False):\n    package_label = ', '.join(packages) if packages else 'None'\n    assembly_label = ', '.join(assemblies) if assemblies else 'None'\n    rows = [\n        '<row r=\"2\" ht=\"24\" customHeight=\"1\">{}</row>'.format(xlsx_cell('A2', title, 1)),\n        '<row r=\"3\">{}{}</row>'.format(xlsx_cell('A3', 'Packages', 2), xlsx_cell('B3', package_label, 3)),\n        '<row r=\"4\">{}{}</row>'.format(xlsx_cell('A4', 'Assemblies', 2), xlsx_cell('B4', assembly_label, 3)),\n        '<row r=\"5\">{}{}</row>'.format(xlsx_cell('A5', 'Generated', 2), xlsx_cell('B5', datetime.datetime.now().strftime('%Y-%m-%d %H:%M'), 3)),\n        '<row r=\"6\" ht=\"22\" customHeight=\"1\">{}</row>'.format(''.join(\n            xlsx_cell('{}6'.format(chr(65 + i)), header, 4) for i, header in enumerate(headers)))\n    ]\n    for index, row in enumerate(data_rows, 7):\n        cells = [xlsx_cell('A{}'.format(index), row['description'], 5),\n                 xlsx_cell('B{}'.format(index), row['size'], 5),\n                 xlsx_cell('C{}'.format(index), row['count'], 6, True)]\n        if pipe_sheet:\n            feet = UnitUtils.ConvertFromInternalUnits(row['length_internal'], UnitTypeId.Feet)\n            cells.append(xlsx_cell('D{}'.format(index), round(feet, 3), 7, True))\n        rows.append('<row r=\"{}\">{}</row>'.format(index, ''.join(cells)))\n    last = max(6, 6 + len(data_rows))\n    last_col = 'D' if pipe_sheet else 'C'\n    return '''<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\n<sheetViews><sheetView showGridLines=\"0\" workbookViewId=\"0\"><pane ySplit=\"6\" topLeftCell=\"A7\" activePane=\"bottomLeft\" state=\"frozen\"/></sheetView></sheetViews>\n<cols><col min=\"1\" max=\"1\" width=\"38\" customWidth=\"1\"/><col min=\"2\" max=\"2\" width=\"23\" customWidth=\"1\"/><col min=\"3\" max=\"3\" width=\"13\" customWidth=\"1\"/><col min=\"4\" max=\"4\" width=\"21\" customWidth=\"1\"/></cols>\n<sheetData>{rows}</sheetData><autoFilter ref=\"A6:{last_col}{last}\"/>\n<pageMargins left=\"0.4\" right=\"0.4\" top=\"0.6\" bottom=\"0.6\" header=\"0.2\" footer=\"0.2\"/>\n</worksheet>'''.format(rows=''.join(rows), last_col=last_col, last=last)\n\n\ndef export_excel(fittings, pipe, packages, assemblies, folder):\n    path = excel_path(folder, packages)\n    fitting_sheet = worksheet_xml('Stratus Package Bill of Material - Fittings',\n                                  packages, assemblies, ['Description', 'Size', 'Count'], fittings, False)\n    pipe_sheet = worksheet_xml('Stratus Package Bill of Material - Pipe',\n                               packages, assemblies, ['Description', 'Size', 'Count', 'Total Length (ft)'], pipe, True)\n    styles = '''<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><fonts count=\"4\"><font><sz val=\"10\"/><name val=\"Arial\"/></font><font><b/><sz val=\"14\"/><name val=\"Arial\"/></font><font><b/><sz val=\"10\"/><color rgb=\"FF404040\"/><name val=\"Arial\"/></font><font><b/><sz val=\"10\"/><color rgb=\"FFFFFFFF\"/><name val=\"Arial\"/></font></fonts><fills count=\"3\"><fill><patternFill patternType=\"none\"/></fill><fill><patternFill patternType=\"gray125\"/></fill><fill><patternFill patternType=\"solid\"><fgColor rgb=\"FF1F4E78\"/><bgColor indexed=\"64\"/></patternFill></fill></fills><borders count=\"2\"><border><left/><right/><top/><bottom/><diagonal/></border><border><left/><right/><top/><bottom style=\"thin\"><color rgb=\"FFD9E2F3\"/></bottom><diagonal/></border></borders><numFmts count=\"1\"><numFmt numFmtId=\"164\" formatCode=\"#,##0.000\"/></numFmts><cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs><cellXfs count=\"8\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/><xf numFmtId=\"0\" fontId=\"1\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyFont=\"1\" applyBorder=\"1\"/><xf numFmtId=\"0\" fontId=\"2\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/><xf numFmtId=\"0\" fontId=\"3\" fillId=\"2\" borderId=\"0\" xfId=\"0\" applyFont=\"1\" applyFill=\"1\" applyAlignment=\"1\"><alignment horizontal=\"center\" vertical=\"center\"/></xf><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyBorder=\"1\"/><xf numFmtId=\"3\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/><xf numFmtId=\"164\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/></cellXfs><cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles></styleSheet>'''\n    content_types = '''<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/><Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/><Override PartName=\"/xl/worksheets/sheet2.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/><Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/></Types>'''\n    root_rels = '''<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>'''\n    workbook = '''<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets><sheet name=\"Fittings\" sheetId=\"1\" r:id=\"rId1\"/><sheet name=\"Pipe\" sheetId=\"2\" r:id=\"rId2\"/></sheets><calcPr calcId=\"191029\" fullCalcOnLoad=\"1\"/></workbook>'''\n    workbook_rels = '''<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/><Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet2.xml\"/><Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/></Relationships>'''\n    with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as archive:\n        for name, data in [('[Content_Types].xml', content_types), ('_rels/.rels', root_rels),\n                           ('xl/workbook.xml', workbook), ('xl/_rels/workbook.xml.rels', workbook_rels),\n                           ('xl/worksheets/sheet1.xml', fitting_sheet),\n                           ('xl/worksheets/sheet2.xml', pipe_sheet), ('xl/styles.xml', styles)]:\n            archive.writestr(name, data.encode('utf-8'))\n    if not os.path.isfile(path) or os.path.getsize(path) == 0 or not zipfile.is_zipfile(path):\n        raise IOError('Excel validation failed after writing: ' + path)\n    return path\n\n\ndef main(apply_changes, folder):\n    uiapp = DocumentManager.Instance.CurrentUIApplication\n    app = uiapp.Application\n    doc = DocumentManager.Instance.CurrentDBDocument\n    if doc.IsFamilyDocument:\n        raise ValueError('Open a Revit project model, not a family document.')\n    (records, packages, assemblies, skipped, phase, description_sources,\n     size_sources) = collect(doc)\n    result = {'status': 'Preview only; set Apply changes to True.',\n              'schedule': SCHEDULE_NAME, 'phase': phase.Name,\n              'eligible_parts': len(records), 'packages': packages,\n              'assemblies': assemblies, 'skipped': skipped,\n              'description_sources_used': description_sources,\n              'size_sources_used': size_sources}\n    if not records:\n        result['status'] = 'No eligible packaged or assembled Fabrication Pipework found.'\n        return result\n    if not apply_changes:\n        return result\n    selection = select_scope(packages, assemblies)\n    if selection is None:\n        result['status'] = 'Cancelled; no Revit or Excel changes were made.'\n        return result\n    selected_packages, selected_assemblies = selection\n    fittings, pipe = aggregate(records, selected_packages, selected_assemblies)\n    if not fittings and not pipe:\n        raise ValueError('The selected packages and assemblies contain no BOM items after exclusions.')\n    result['selected_packages'] = selected_packages\n    result['selected_assemblies'] = selected_assemblies\n    result['fitting_groups'] = len(fittings)\n    result['pipe_groups'] = len(pipe)\n    result['excel'] = export_excel(fittings, pipe, selected_packages,\n                                   selected_assemblies, folder)\n    manager = TransactionManager.Instance\n    manager.EnsureInTransaction(doc)\n    sub = SubTransaction(doc)\n    sub.Start()\n    revit_error = None\n    try:\n        ensure_parameters(doc, app)\n        doc.Regenerate()\n        for record in records:\n            set_value(record['element'], BOM_CLASS, record['category'])\n            set_value(record['element'], BOM_DESCRIPTION, record['description'])\n            set_value(record['element'], BOM_SIZE, record['size'])\n            set_value(record['element'], BOM_LENGTH,\n                      record['length_internal'] if record['category'] == 'Pipe' else 0.0)\n        schedule = replace_schedule(doc, phase)\n        result['schedule_id'] = eid_value(schedule.Id)\n        if sub.Commit() != TransactionStatus.Committed:\n            raise RuntimeError('Revit did not commit the Bill of Material changes.')\n    except Exception as error:\n        if sub.GetStatus() == TransactionStatus.Started:\n            sub.RollBack()\n        revit_error = str(error)\n    finally:\n        manager.TransactionTaskDone()\n    if revit_error:\n        result['revit_error'] = revit_error\n        result['status'] = 'Excel saved, but the Revit schedule update failed.'\n        return result\n    result['status'] = ('Saved Excel and updated {} parts; recreated schedule \"{}\".'\n                        .format(len(records), SCHEDULE_NAME))\n    return result\n\n\ntry:\n    _apply = bool(IN[0]) if IN and len(IN) > 0 and IN[0] is not None else False\n    _folder = str(IN[1]) if IN and len(IN) > 1 and IN[1] is not None else ''\n    OUT = main(_apply, _folder)\nexcept Exception as error:\n    OUT = {'status': 'Stopped', 'error': str(error)}\n",
+      "Engine": "CPython3",
+      "VariableInputPorts": true,
+      "Id": "3fbef3ad329a57958147d22959b2a235",
+      "NodeType": "PythonScriptNode",
+      "Inputs": [
+        {
+          "Id": "636b5b59ca485ae08b6cc3956ceec924",
+          "Name": "IN[0]",
+          "Description": "IN[0]",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "923fab7e1c825094945a0cb5bbf512f5",
+          "Name": "IN[1]",
+          "Description": "IN[1]",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "9a0815e4f5cb5ff1a07ec78434d88c86",
+          "Name": "OUT",
+          "Description": "OUT",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Runs an embedded Python script."
+    },
+    {
+      "ConcreteType": "CoreNodeModels.Watch, CoreNodeModels",
+      "WatchWidth": 200.0,
+      "WatchHeight": 200.0,
+      "Id": "fa1616621d6a555d8fee889370ba1d61",
+      "NodeType": "ExtensionNode",
+      "Inputs": [
+        {
+          "Id": "285d398a2cb15944bdfd1ab4422c9c4d",
+          "Name": "",
+          "Description": "",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "2ba6ceed08505250b4a90c72a64ad96e",
+          "Name": "",
+          "Description": "",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Visualizes a node's output"
+    }
+  ],
+  "Connectors": [
+    {
+      "Start": "4012ac493a58580aa3e04f57eec04d00",
+      "End": "636b5b59ca485ae08b6cc3956ceec924",
+      "Id": "14cacf74461b5a1fa55fb868b473cb78",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "f7b49a7e83045f909cd8132ddf0e11a5",
+      "End": "923fab7e1c825094945a0cb5bbf512f5",
+      "Id": "4bce20670fe05e01bf2ff4d37119012d",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "9a0815e4f5cb5ff1a07ec78434d88c86",
+      "End": "285d398a2cb15944bdfd1ab4422c9c4d",
+      "Id": "cbc087b1f59d5e15adc374f5b4c773b8",
+      "IsHidden": "False"
+    }
+  ],
+  "Dependencies": [],
+  "NodeLibraryDependencies": [],
+  "EnableLegacyPolyCurveBehavior": true,
+  "Thumbnail": null,
+  "GraphDocumentationURL": null,
+  "ExtensionWorkspaceData": [
+    {
+      "ExtensionGuid": "28992e1d-abb9-417f-8b1b-05e053bee670",
+      "Name": "Properties",
+      "Version": "3.0",
+      "Data": {}
+    },
+    {
+      "ExtensionGuid": "DFBD9CC0-DB40-457A-939E-8C8555555A9D",
+      "Name": "Generative Design",
+      "Version": "7.1",
+      "Data": {}
+    }
+  ],
+  "Author": "None provided",
+  "Linting": {
+    "activeLinter": "None",
+    "activeLinterId": "7b75fb44-43fd-4631-a878-29f4d5d8399a",
+    "warningCount": 0,
+    "errorCount": 0
+  },
+  "Bindings": [],
+  "View": {
+    "Dynamo": {
+      "ScaleFactor": 1.0,
+      "HasRunWithoutCrash": true,
+      "IsVisibleInDynamoLibrary": true,
+      "Version": "3.0.3.7597",
+      "RunType": "Manual",
+      "RunPeriod": "1000"
+    },
+    "Camera": {
+      "Name": "_Background Preview",
+      "EyeX": -17.0,
+      "EyeY": 24.0,
+      "EyeZ": 50.0,
+      "LookX": 12.0,
+      "LookY": -13.0,
+      "LookZ": -58.0,
+      "UpX": 0.0,
+      "UpY": 1.0,
+      "UpZ": 0.0
+    },
+    "ConnectorPins": [],
+    "NodeViews": [
+      {
+        "Id": "28400e43173654fabcccfc058184d073",
+        "Name": "Apply and create BOM (False = preview)",
+        "IsSetAsInput": true,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": false,
+        "X": 0.0,
+        "Y": 80.0
+      },
+      {
+        "Id": "5f455f916b175e5a9d320aae53eb480d",
+        "Name": "Excel folder (blank = Downloads)",
+        "IsSetAsInput": true,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": false,
+        "X": 0.0,
+        "Y": 220.0
+      },
+      {
+        "Id": "3fbef3ad329a57958147d22959b2a235",
+        "Name": "Stratus Package Bill of Material",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": false,
+        "X": 410.0,
+        "Y": 150.0
+      },
+      {
+        "Id": "fa1616621d6a555d8fee889370ba1d61",
+        "Name": "Results / diagnostics",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": true,
+        "Excluded": false,
+        "ShowGeometry": false,
+        "X": 820.0,
+        "Y": 150.0
+      }
+    ],
+    "Annotations": [],
+    "X": 40.0,
+    "Y": 80.0,
+    "Zoom": 0.85
+  }
+}
